@@ -95,18 +95,20 @@ async def stream_logs(run_id: str, request: Request):
         try:
             while True:
                 try:
-                    item = q.get(timeout=0.1)
-                    if item is None:
-                        if result:
-                            yield {"data": json.dumps({"type": "result", **result})}
-                        yield {"data": json.dumps({"type": "done"})}
-                        break
-                    elif "status" in item:
-                        result = item
-                    else:
-                        yield {"data": json.dumps({"type": "log", **item})}
+                    item = q.get_nowait()
                 except queue.Empty:
                     await asyncio.sleep(0.05)
+                    continue
+
+                if item is None:
+                    if result:
+                        yield {"data": json.dumps({"type": "result", **result})}
+                    yield {"data": json.dumps({"type": "done"})}
+                    break
+                elif "status" in item:
+                    result = item
+                else:
+                    yield {"data": json.dumps({"type": "log", **item})}
         finally:
             _log_queues.pop(run_id, None)
 

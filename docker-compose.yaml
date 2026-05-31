@@ -41,7 +41,6 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       ENVIRONMENT: production
       TESSERACT_CMD: ""
-      PREFECT_API_URL: http://prefect-server:4200/api
     depends_on:
       postgres:
         condition: service_healthy

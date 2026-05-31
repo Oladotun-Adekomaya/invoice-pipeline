@@ -8,28 +8,31 @@
 
 ## Overview
 
-This pipeline ingests telecom and IT invoices as PDFs, extracts structured data using Tesseract OCR, normalises and validates the data, then routes each invoice to automatic approval or a human review queue. Every decision is persisted to PostgreSQL with a full audit trail.
+This pipeline ingests telecom and IT invoices as PDFs, extracts structured data using Tesseract OCR followed by Claude AI field extraction, normalises and validates the data, then routes each invoice to automatic approval or a human review queue. Every decision is persisted to PostgreSQL with a full audit trail.
 
 ```
-PDF (folder drop)
+PDF (folder drop or web upload)
       │
-  [Intake]       Stage file, compute SHA-256, emit FileRecord
+  [Intake]         Stage file, compute SHA-256, emit FileRecord
       │
-[Extraction]     Convert PDF → images (pdf2image/Poppler), run Tesseract OCR, regex parse
+[Extraction]       Convert PDF → images (pdf2image/Poppler)
+                   Run Tesseract OCR → raw text
+                   Send raw text to Claude AI → structured fields
       │
-[Normalization]  Raw strings → typed Python: Decimal amounts, date objects, UUID invoice ID
+[Normalization]    Raw strings → typed Python: Decimal amounts, date objects, UUID invoice ID
       │
-[Validation]     5 business rules: required fields, positive amount, threshold, vendor, dates
+[Validation]       5 business rules: required fields, positive amount, threshold, vendor, dates
       │
    ┌──┴──┐
-[Approve]    [Review]    [Dead-letter]
-Postgres     Postgres     Postgres
-             + Slack      + Slack
+[Approve]      [Review]      [Dead-letter]
+Postgres       Postgres       Postgres
+               + Slack        + Slack
 ```
 
 **Orchestrator:** Prefect  
 **Database:** PostgreSQL 16 (Docker)  
 **OCR engine:** Tesseract 5.5 + pdf2image (Poppler)  
+**AI extraction:** Claude claude-haiku-4-5-20251001 (Anthropic API)  
 **Language:** Python 3.12  
 
 ---
@@ -54,6 +57,15 @@ tesseract --version
 pdfinfo --version
 ```
 
+### Environment variables required
+
+| Variable | Purpose |
+|----------|---------|
+| `DATABASE_URL` | PostgreSQL connection string |
+| `ANTHROPIC_API_KEY` | Claude API key for AI field extraction |
+| `SLACK_WEBHOOK_URL` | Slack alerts for review/dead-letter events |
+| `AUTO_APPROVE_THRESHOLD` | Max invoice amount for auto-approval (default $5,000) |
+
 ### Activate the environment
 
 ```bash
@@ -73,6 +85,10 @@ Output will be one of:
 - `result: sent_to_review` — invoice written to `invoices` table, status = review, Slack alert sent
 - `result: dead_lettered` — invoice written to `dead_letter_invoices` table, Slack alert sent
 
+### Run via the web interface
+
+The FastAPI web interface is available at `https://invoice-pipeline.lameda-ai.xyz`. Upload any PDF invoice and the result is displayed on the page — extracted fields, routing outcome, and any failed validation rules.
+
 ### Run the folder watcher (continuous mode)
 
 In one terminal, start Prefect server:
@@ -87,7 +103,7 @@ python src/intake/watcher.py
 
 Drop any PDF into the `./incoming` folder. The watcher detects it and triggers the pipeline automatically.
 
-Prefect UI is available at: `http://127.0.0.1:4200`
+Prefect UI available at: `http://127.0.0.1:4200` (local) or `https://invoice-pipeline-prefect.lameda-ai.xyz` (production)
 
 ### Run tests
 
@@ -98,11 +114,35 @@ pytest tests/ --cov=src            # all tests with coverage
 
 ---
 
+## Extraction architecture
+
+The extraction stage uses a two-step approach:
+
+**Step 1 — Tesseract OCR**  
+Converts each PDF page to a 300 DPI image using pdf2image (Poppler backend), then runs Tesseract OCR to produce raw text. This handles both digitally-generated and scanned PDFs.
+
+**Step 2 — Claude AI extraction**  
+The raw OCR text is sent to `claude-haiku-4-5-20251001` with a structured prompt asking it to extract specific fields and return valid JSON. Claude handles format variations across vendors (different date formats, currency positions, label names) without any vendor-specific code.
+
+**Fallback behaviour**  
+If `ANTHROPIC_API_KEY` is not set, or if the Claude API returns an error or invalid JSON, the pipeline automatically falls back to regex-based extraction. The fallback is less accurate on unusual formats but ensures the pipeline never crashes due to API unavailability.
+
+```
+PDF → Tesseract → raw text → Claude API → JSON fields
+                                  ↓ (on failure)
+                             regex fallback → fields
+```
+
+**Extraction cost**  
+Claude Haiku at current pricing costs approximately $0.00025 per invoice (roughly 2,000 input tokens). At 100 invoices per day this is under $1/month.
+
+---
+
 ## Monitoring
 
 ### Prefect UI
 
-Every pipeline run appears in the Prefect UI at `http://127.0.0.1:4200` under "Flow Runs". Each run shows:
+Every pipeline run appears in the Prefect UI at `https://invoice-pipeline-prefect.lameda-ai.xyz` under "Flow Runs". Each run shows:
 - Run name (auto-generated, e.g. `spectacular-dragonfly`)
 - State: Completed / Failed / Retrying
 - Per-task timing and state
@@ -147,39 +187,43 @@ Connect to the database:
 docker exec -it invoice-db psql -U postgres -d invoices
 ```
 
-### Log structure
-
-Every log event is structured JSON in production and coloured text in development. All events carry:
-
-| Field | Description |
-|-------|-------------|
-| `timestamp` | ISO 8601 UTC |
-| `level` | info / warning / error |
-| `pipeline_run_id` | UUID bound at flow start — links all events for one run |
-| `invoice_id` | UUID assigned at normalisation |
-| `stage` | Which module emitted the log |
-| `event` | Short description of what happened |
-
-To find all logs for a specific run:
-```bash
-# If logging to a file, grep by pipeline_run_id
-grep "pipeline_run_id=48127163" pipeline.log
-```
-
 ---
 
 ## Common failure modes
 
+### Claude API returns invalid JSON
+
+**Symptom:** Log shows `claude returned invalid json, falling back to regex`. Pipeline continues with regex fallback.
+
+**Cause:** Occasionally Claude returns a response wrapped in markdown fences despite instructions not to. The parser strips common fence patterns but edge cases may slip through.
+
+**Fix:** The fallback handles this automatically. If regex fallback is also failing, check the raw OCR text quality — if Tesseract produced garbled output, Claude can't extract clean fields from it either.
+
+---
+
+### Claude API key missing or invalid
+
+**Symptom:** Log shows `no anthropic api key configured, using regex fallback` or `gemini extraction failed, falling back to regex`.
+
+**Cause:** `ANTHROPIC_API_KEY` environment variable is not set or has expired.
+
+**Fix:**
+1. Get a fresh API key from https://console.anthropic.com
+2. Update the environment variable in `.env` (local) or Coolify environment variables (production)
+3. Restart the app container
+
+---
+
 ### OCR produces empty or garbled text
 
-**Symptom:** `characters=0` or very low character count in extraction log. Fields missing from parsed output.
+**Symptom:** `characters=0` or very low character count in extraction log. Claude receives poor input and returns incomplete fields.
 
 **Cause:** PDF is scanned at low resolution, uses unusual fonts, or is image-only without embedded text.
 
 **Fix:**
 1. Check the raw PDF visually — open it and confirm the text is readable by a human
 2. Try increasing DPI in `ocr_client.py` from 300 to 400 for low-quality scans
-3. If the PDF is password-protected, it will produce no output — check with `pdfinfo invoice.pdf`
+3. If the PDF is password-protected it will produce no output — check with `pdfinfo invoice.pdf`
 4. Invoice will land in `dead_letter_invoices` with `error_stage = extraction`
 
 ---
@@ -191,14 +235,11 @@ grep "pipeline_run_id=48127163" pipeline.log
 PDFInfoNotInstalledError: Unable to get page count. Is poppler installed and in PATH?
 ```
 
-**Cause:** Poppler binaries are not installed or not in the system PATH.
-
 **Fix (Windows):**
 1. Download from https://github.com/oschwartz10612/poppler-windows/releases
 2. Extract to `C:\Program Files\poppler`
 3. Add `C:\Program Files\poppler\Library\bin` to system PATH
-4. Open a new terminal (PATH changes don't apply to open terminals)
-5. Verify: `pdfinfo --version`
+4. Open a new terminal and verify: `pdfinfo --version`
 
 **Fix (Linux):**
 ```bash
@@ -211,12 +252,11 @@ sudo apt install poppler-utils -y
 
 **Symptom:** Invoice routed to review queue. Slack alert shows failed rule `vendor_known`.
 
-**Cause:** OCR read the vendor name correctly but it matches the blocklist (`unknown`, `test`, `sample`) or is an empty string.
+**Cause:** The vendor name extracted by Claude matches the blocklist (`unknown`, `test`, `sample`) or is an empty string — usually means Tesseract produced very poor output for that invoice.
 
 **Fix:**
-1. Check the raw OCR output — was the vendor name actually extracted?
-2. If yes and it's a legitimate vendor, the blocklist logic in `src/validation/rules.py` `check_vendor_known` may need updating
-3. In production this would be a database lookup — see design doc for v2 proposal
+1. Check the raw OCR output quality for that file
+2. If the vendor name is legitimate, update the blocklist logic in `src/validation/rules.py`
 
 ---
 
@@ -234,22 +274,6 @@ sudo apt install poppler-utils -y
 ```sql
 UPDATE invoices SET status = 'approved' WHERE invoice_id = 'uuid-here';
 ```
-3. If the threshold needs adjusting, update `AUTO_APPROVE_THRESHOLD` in `.env` and restart
-
----
-
-### Service period dates parse incorrectly
-
-**Symptom:** `NormalizationError: service_period_end is before service_period_start`
-
-**Cause:** The service period string uses an unusual separator or format that the parser doesn't handle.
-
-**Fix:**
-1. Check what format the invoice uses — common alternatives: `01/01/2024 to 01/31/2024`, `2024-01-01 through 2024-01-31`
-2. Add the pattern to `parse_service_period` in `src/normalization/transformer.py`
-3. The split regex is: `r"\s+[-–—]\s+|\s+to\s+"` — extend this for new separators
-
-**Note:** If the service period can't be parsed it returns `None, None` silently — it's optional. Only hard-fail if the format causes the start > end check in `Invoice.__post_init__` to trip.
 
 ---
 
@@ -260,15 +284,13 @@ UPDATE invoices SET status = 'approved' WHERE invoice_id = 'uuid-here';
 psycopg.OperationalError: connection refused
 ```
 
-**Cause:** Postgres Docker container is not running.
-
 **Fix:**
 ```bash
 docker start invoice-db
 docker ps   # confirm it shows "Up"
 ```
 
-If the container doesn't exist at all (first run or was deleted):
+If the container doesn't exist:
 ```bash
 docker run --name invoice-db \
   -e POSTGRES_PASSWORD=dev \
@@ -276,7 +298,6 @@ docker run --name invoice-db \
   -p 5432:5432 \
   -d postgres:16
 
-# Re-run migrations
 docker exec -i invoice-db psql -U postgres -d invoices < migrations/001_initial_schema.sql
 ```
 
@@ -284,33 +305,12 @@ docker exec -i invoice-db psql -U postgres -d invoices < migrations/001_initial_
 
 ### Slack notifications not sending
 
-**Symptom:** Pipeline completes but no Slack message received. Log shows:
-```
-[warning] slack webhook not configured, skipping notification
-```
-or
-```
-[error] slack notification failed
-```
-
-**Cause:** `SLACK_WEBHOOK_URL` in `.env` is still set to `placeholder`, or the webhook URL has been revoked.
+**Symptom:** Log shows `slack webhook not configured, skipping notification` or `slack notification failed`.
 
 **Fix:**
 1. Go to https://api.slack.com/apps, find your app, check Incoming Webhooks
-2. Copy the current webhook URL and update `.env`
-3. Test the webhook directly:
-```bash
-python -c "
-import httpx
-import os
-from dotenv import load_dotenv
-load_dotenv()
-r = httpx.post(os.getenv('SLACK_WEBHOOK_URL'), json={'text': 'test'})
-print(r.status_code)
-"
-```
-
-**Important:** A failed Slack notification never crashes the pipeline. The invoice is already safely in Postgres at this point. Notifications are best-effort.
+2. Copy the current webhook URL and update `SLACK_WEBHOOK_URL` in `.env` or Coolify
+3. A failed Slack notification never crashes the pipeline — the invoice is already in Postgres
 
 ---
 
@@ -326,16 +326,12 @@ SELECT id, file_id, error_stage, error_detail FROM dead_letter_invoices ORDER BY
 ls staging/<file_id>/
 ```
 
-3. Re-run the pipeline against the staged file:
+3. Re-run the pipeline:
 ```bash
 python -m src.pipeline staging/<file_id>/<filename>.pdf
 ```
 
-4. If the re-run succeeds, optionally mark the dead-letter record as resolved:
-```sql
--- dead_letter_invoices has no status column by design — it is an immutable audit log.
--- Do not delete rows. Add a note in your incident log instead.
-```
+4. Dead-letter rows are never deleted — they are an immutable audit log.
 
 ---
 
@@ -349,6 +345,7 @@ python -m src.pipeline staging/<file_id>/<filename>.pdf
 | pydantic-settings | 2.14.1 |
 | structlog | 25.5.0 |
 | tenacity | 9.1.4 |
+| anthropic | 0.28+ |
 | pytesseract | 0.3.10+ |
 | pdf2image | 1.17+ |
 | psycopg | 3.1+ |

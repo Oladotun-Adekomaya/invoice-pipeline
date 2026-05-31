@@ -33,7 +33,7 @@ services:
     container_name: invoice-app
     restart: unless-stopped
     ports:
-      - "8000:8000"
+      - "24574:8000"
     environment:
       DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@postgres:5432/invoices
       SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL}

@@ -1,5 +1,5 @@
 import re
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
 from uuid import UUID
 

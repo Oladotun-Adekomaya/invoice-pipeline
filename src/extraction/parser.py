@@ -20,32 +20,41 @@ class RawInvoiceFields(TypedDict, total=False):
     account_number: str
     service_period: str
     tax_amount: str
+    service_type: str       # voice, data, cloud, mobility etc
+    circuit_id: str         # telecom line/circuit identifier
+    site_id: str            # location/site being billed
+    po_number: str          # purchase order number
+    cost_center: str        # internal department code
 
 
-EXTRACTION_PROMPT = """You are an invoice data extraction specialist. Extract structured fields from the following invoice text.
+EXTRACTION_PROMPT = """You are a telecom and IT expense management specialist. 
+Extract structured fields from the following invoice text.
 
-Return ONLY a valid JSON object with these fields. If a field is not found, omit it entirely — do not include null values.
+Return ONLY a valid JSON object. Omit fields that are not found.
 
 Fields to extract:
 - vendor_name: the company issuing the invoice
-- invoice_number: the invoice or document number
-- invoice_date: the invoice date in YYYY-MM-DD format
-- due_date: the payment due date in YYYY-MM-DD format
-- total_amount: the total amount as a plain number string e.g. "1321.79" (no currency symbols)
-- currency: ISO 4217 currency code e.g. USD, EUR, GBP, CAD
+- invoice_number: invoice or document number
+- invoice_date: invoice date in YYYY-MM-DD format
+- due_date: payment due date in YYYY-MM-DD format
+- total_amount: final total as plain number e.g. "1321.79"
+- currency: ISO 4217 code e.g. USD, EUR, GBP, CAD
 - account_number: customer or account number
-- service_period: the billing/service period as a plain string e.g. "July 1 - July 31, 2018"
-- tax_amount: tax or VAT amount as a plain number string
+- service_period: billing period e.g. "July 1 - July 31, 2024"
+- tax_amount: tax or VAT amount as plain number
+- service_type: type of service e.g. "voice", "data", "cloud compute", "mobility"
+- circuit_id: telecom circuit or line identifier if present
+- site_id: location or site identifier if present
+- po_number: purchase order number if present
+- cost_center: cost center or department code if present
 
 Rules:
-- For total_amount: use the final total the customer owes, not subtotals
-- For currency: detect from context (EUR, GBP, CAD, USD etc)
-- For dates: always convert to YYYY-MM-DD format
-- Return ONLY the JSON object, no explanation, no markdown, no backticks
+- Dates always in YYYY-MM-DD format
+- Amounts as plain numbers, no symbols or commas
+- Return ONLY the JSON object, no markdown, no explanation
 
 Invoice text:
 """
-
 
 def parse_text(raw_text: str) -> RawInvoiceFields:
     if not settings.anthropic_api_key:

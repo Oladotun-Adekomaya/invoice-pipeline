@@ -25,6 +25,7 @@ dependencies = [
     "uvicorn>=0.29",
     "python-multipart>=0.0.9",
     "anthropic>=0.28",
+    "sse-starlette>=1.8",
 ]
 
 [project.optional-dependencies]

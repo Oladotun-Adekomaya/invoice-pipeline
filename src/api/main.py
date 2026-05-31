@@ -7,20 +7,13 @@ import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-import structlog
-import structlog.contextvars
 from fastapi import FastAPI, File, UploadFile, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from sse_starlette.sse import EventSourceResponse
 
 from src.db import run_migrations
-from src.extraction.ocr_client import extract_text
-from src.extraction.parser import parse_text
-from src.normalization.transformer import transform, NormalizationError
+from src.normalization.transformer import NormalizationError
 from src.observability.logger import setup_logging, get_logger
-from src.routing.approver import route
-from src.routing.notifier import notify
-from src.validation.engine import validate
 
 setup_logging()
 logger = get_logger(__name__)
@@ -41,85 +34,19 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 _log_queues: dict[str, queue.Queue] = {}
 
 
-class QueueLogProcessor:
-    """structlog processor that puts log events into a queue for SSE streaming."""
+def _run_pipeline(file_path: Path, run_id: str) -> None:
+    from src.pipeline import run_pipeline, _thread_queue as _pipeline_thread_queue
 
-    def __init__(self, run_id: str):
-        self.run_id = run_id
-
-    def __call__(self, logger, method, event_dict):
-        if self.run_id in _log_queues:
-            _log_queues[self.run_id].put({
-                "level": event_dict.get("level", "info"),
-                "event": event_dict.get("event", ""),
-                "stage": event_dict.get("stage", ""),
-            })
-        return event_dict
-
-
-def run_pipeline_sync(file_path: Path, file_id: uuid.UUID, run_id: str) -> None:
     q = _log_queues[run_id]
-    import os
-    os.environ["PREFECT_API_URL"] = "http://prefect-server:4200/api"
+    _pipeline_thread_queue.queue = q
 
-    def emit(level: str, event: str, **kwargs):
-        q.put({"level": level, "event": event, **kwargs})
+    def emit(level: str, event: str) -> None:
+        q.put({"level": level, "event": event})
 
     try:
         emit("info", "📄 File received, starting pipeline")
-
-        emit("info", "🔍 Converting PDF to images and running OCR")
-        text = extract_text(file_path)
-        emit("info", f"✓ OCR complete — {len(text)} characters extracted")
-
-        emit("info", "🤖 Sending to Claude AI for field extraction")
-        raw = parse_text(text)
-        emit("info", f"✓ Extracted {len(raw)} fields: {', '.join(raw.keys())}")
-
-        emit("info", "🔧 Normalizing fields")
-        invoice = transform(raw, file_id=file_id)
-        emit("info", f"✓ Normalized — vendor: {invoice.vendor_name}, total: ${invoice.total_amount}")
-
-        emit("info", "✅ Running validation rules")
-        report = validate(invoice)
-        for r in report.results:
-            icon = "✓" if r.passed else "✗"
-            emit("info" if r.passed else "warning", f"  {icon} {r.rule_name}: {r.message or 'passed'}")
-
-        emit("info", "📬 Routing invoice")
-        outcome = route(invoice, report)
-        notify(invoice, report, outcome)
-        emit("info", f"✓ Done — {outcome.action.value}")
-
-        failed_rules = [
-            {"rule": r.rule_name, "message": r.message}
-            for r in report.failed_rules()
-        ]
-
-        q.put({
-            "status": outcome.action.value,
-            "reason": outcome.reason,
-            "fields": {
-                "invoice_id": str(invoice.invoice_id),
-                "vendor_name": invoice.vendor_name,
-                "invoice_number": invoice.invoice_number,
-                "invoice_date": str(invoice.invoice_date),
-                "due_date": str(invoice.due_date) if invoice.due_date else None,
-                "total_amount": str(invoice.total_amount),
-                "currency": invoice.currency,
-                "tax_amount": str(invoice.tax_amount) if invoice.tax_amount else None,
-                "account_number": invoice.account_number,
-                "service_period_start": str(invoice.service_period_start) if invoice.service_period_start else None,
-                "service_period_end": str(invoice.service_period_end) if invoice.service_period_end else None,
-                "service_type": raw.get("service_type"),
-                "circuit_id": raw.get("circuit_id"),
-                "site_id": raw.get("site_id"),
-                "po_number": raw.get("po_number"),
-                "cost_center": raw.get("cost_center"),
-            },
-            "failed_rules": failed_rules,
-        })
-
+        result = run_pipeline(str(file_path))
+        q.put(result)
     except NormalizationError as e:
         emit("error", f"✗ Normalization failed: {e}")
         q.put({"status": "dead_lettered", "reason": str(e), "fields": {}, "failed_rules": []})
@@ -127,6 +54,7 @@ def run_pipeline_sync(file_path: Path, file_id: uuid.UUID, run_id: str) -> None:
         emit("error", f"✗ Pipeline error: {e}")
         q.put({"status": "error", "reason": str(e), "fields": {}, "failed_rules": []})
     finally:
+        _pipeline_thread_queue.queue = None
         file_path.unlink(missing_ok=True)
         q.put(None)  # sentinel — close the stream
 
@@ -151,12 +79,7 @@ async def upload_invoice(file: UploadFile = File(...)):
 
     _log_queues[run_id] = queue.Queue()
 
-    def run():
-        import os
-        os.environ["PREFECT_API_URL"] = "http://prefect-server:4200/api"
-        run_pipeline_sync(dest, file_id, run_id)
-
-    thread = threading.Thread(target=run, daemon=True)
+    thread = threading.Thread(target=_run_pipeline, args=(dest, run_id), daemon=True)
     thread.start()
 
     return JSONResponse(content={"run_id": run_id})

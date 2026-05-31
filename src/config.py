@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     environment: str = "development"
     tesseract_cmd: str = ""
+    anthropic_api_key: str = ""
 
 
 settings: Settings = Settings() # type: ignore

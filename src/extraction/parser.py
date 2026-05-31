@@ -1,6 +1,10 @@
+import json
 import re
 from typing import TypedDict
 
+import anthropic
+
+from src.config import settings
 from src.observability.logger import get_logger
 
 logger = get_logger(__name__)
@@ -18,50 +22,134 @@ class RawInvoiceFields(TypedDict, total=False):
     tax_amount: str
 
 
-def _find(pattern: str, text: str, flags: int = re.IGNORECASE) -> str | None:
-    match = re.search(pattern, text, flags)
-    if match:
-        return match.group(1).strip()
-    return None
+EXTRACTION_PROMPT = """You are an invoice data extraction specialist. Extract structured fields from the following invoice text.
+
+Return ONLY a valid JSON object with these fields. If a field is not found, omit it entirely — do not include null values.
+
+Fields to extract:
+- vendor_name: the company issuing the invoice
+- invoice_number: the invoice or document number
+- invoice_date: the invoice date in YYYY-MM-DD format
+- due_date: the payment due date in YYYY-MM-DD format
+- total_amount: the total amount as a plain number string e.g. "1321.79" (no currency symbols)
+- currency: ISO 4217 currency code e.g. USD, EUR, GBP, CAD
+- account_number: customer or account number
+- service_period: the billing/service period as a plain string e.g. "July 1 - July 31, 2018"
+- tax_amount: tax or VAT amount as a plain number string
+
+Rules:
+- For total_amount: use the final total the customer owes, not subtotals
+- For currency: detect from context (EUR, GBP, CAD, USD etc)
+- For dates: always convert to YYYY-MM-DD format
+- Return ONLY the JSON object, no explanation, no markdown, no backticks
+
+Invoice text:
+"""
 
 
 def parse_text(raw_text: str) -> RawInvoiceFields:
+    if not settings.anthropic_api_key:
+        logger.warning("no anthropic api key set, falling back to regex parser")
+        return _regex_fallback(raw_text)
+
+    logger.info("extracting fields with claude")
+
+    client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+
+    try:
+        message = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=1024,
+            messages=[
+                {
+                    "role": "user",
+                    "content": EXTRACTION_PROMPT + raw_text
+                }
+            ]
+        )
+
+        from anthropic.types import TextBlock
+
+        text_blocks = [block for block in message.content if isinstance(block, TextBlock)]
+        if not text_blocks:
+            raise ValueError("claude returned no text content")
+        response_text = text_blocks[0].text.strip()
+
+        # Strip markdown code fences if Claude adds them despite instructions
+        response_text = re.sub(r"^```(?:json)?\s*", "", response_text)
+        response_text = re.sub(r"\s*```$", "", response_text)
+
+        fields = json.loads(response_text)
+
+        # Ensure all values are strings (Claude occasionally returns numbers)
+        cleaned: RawInvoiceFields = {}
+        for key, value in fields.items():
+            if key in RawInvoiceFields.__annotations__ and value is not None:
+                cleaned[key] = str(value)  # type: ignore
+
+        found = list(cleaned.keys())
+        logger.info(
+            "ai extraction complete",
+            fields_found=found,
+            total_fields=len(found),
+            model="claude-haiku",
+        )
+
+        return cleaned
+
+    except json.JSONDecodeError as e:
+        logger.error("claude returned invalid json, falling back to regex", error=str(e))
+        return _regex_fallback(raw_text)
+    except Exception as e:
+        logger.error("claude extraction failed, falling back to regex", error=str(e))
+        return _regex_fallback(raw_text)
+
+
+def _regex_fallback(raw_text: str) -> RawInvoiceFields:
+    """
+    Simple regex fallback used when the AI extraction is unavailable.
+    Less accurate but works without an API key.
+    """
+    logger.info("using regex fallback for extraction")
     fields: RawInvoiceFields = {}
 
-    vendor = _find(r"^([A-Z][A-Za-z0-9\s&,\.]+(?:Corp|Inc|LLC|Ltd|Co)\.?)", raw_text, re.MULTILINE)
+    def _find(pattern: str, text: str = raw_text, flags: int = re.IGNORECASE) -> str | None:
+        match = re.search(pattern, text, flags)
+        return match.group(1).strip() if match else None
+
+    vendor = _find(r"^(AMAZON\s+WEB\s+SERVICES[A-Za-z\s]*(?:SARL|LLC|Inc\.?))", flags=re.MULTILINE) or \
+             _find(r"^(CANADA\s+POST\s+CORPORATION)", flags=re.MULTILINE | re.IGNORECASE) or \
+             _find(r"^([A-Z][A-Za-z0-9\s&,\.]+(?:Corp|Inc|LLC|Ltd|Co|SARL)\.?)", flags=re.MULTILINE)
     if vendor:
         fields["vendor_name"] = vendor.strip()
 
-    invoice_number = _find(r"invoice\s*(?:number|no\.?|#)\s*[:\-]?\s*([A-Z0-9\-]+)", raw_text)
-    if invoice_number:
-        fields["invoice_number"] = invoice_number
+    inv_num = _find(r"(?:vat\s+|tax\s+)?invoice\s*(?:number|no\.?|#)\s*[:\-]?\s*([A-Z0-9\-]+)")
+    if inv_num:
+        fields["invoice_number"] = inv_num
 
-    invoice_date = _find(r"invoice\s*date\s*[:\-]?\s*([A-Za-z0-9,\s]+(?:\d{4}))", raw_text)
-    if invoice_date:
-        fields["invoice_date"] = invoice_date.strip()
+    inv_date = _find(r"(?:vat\s+|tax\s+)?invoice\s*date[^:]*[:\-]?\s*(\d{4}[-/]\d{2}[-/]\d{2})") or \
+               _find(r"(?:vat\s+|tax\s+)?invoice\s*date\s*[:\-]?\s*([A-Za-z]+\s+\d{1,2},?\s+\d{4})")
+    if inv_date:
+        fields["invoice_date"] = inv_date.strip()
 
-    due_date = _find(r"due\s*date\s*[:\-]?\s*([A-Za-z0-9,\s]+(?:\d{4}))", raw_text)
-    if due_date:
-        fields["due_date"] = due_date.strip()
+    due = _find(r"(?:due\s*date|payment\s*is\s*due\s*by)[^:]*[:\-]?\s*(\d{4}[-/]\d{2}[-/]\d{2})")
+    if due:
+        fields["due_date"] = due.strip()
 
-    total = _find(r"total\s*(?:amount\s*)?(?:due\s*)?[:\-]?\s*\$?([\d,]+\.?\d{0,2})", raw_text)
+    total = _find(r"total\s*amount[^:]*[:\-]?\s*(?:USD|EUR|GBP|CAD)?\s*\$?\s*([\d,]+\.?\d{0,2})")
     if total:
-        fields["total_amount"] = total
-        fields["currency"] = "USD"
+        fields["total_amount"] = total.replace(",", "")
+        if re.search(r"canada\s*post|canadian", raw_text, re.IGNORECASE):
+            fields["currency"] = "CAD"
+        elif re.search(r"selected\s+(EUR|GBP)\s+as\s+your\s+preferred", raw_text, re.IGNORECASE):
+            m = re.search(r"selected\s+(EUR|GBP)\s+as", raw_text, re.IGNORECASE)
+            fields["currency"] = m.group(1).upper() if m else "USD"
+        else:
+            fields["currency"] = "USD"
 
-    tax = _find(r"(?:tax|vat)\s*[:\-]?\s*\$?([\d,]+\.?\d{0,2})", raw_text)
-    if tax:
-        fields["tax_amount"] = tax
-
-    account = _find(r"account\s*(?:number|no\.?|#)\s*[:\-]?\s*([A-Z0-9\-]+)", raw_text)
+    account = _find(r"(?:account|customer)\s*(?:number|no\.?|#)\s*[:\-]?\s*([A-Z0-9\-]+)")
     if account:
         fields["account_number"] = account
 
-    period = _find(r"service\s*period\s*[:\-]?\s*([A-Za-z0-9\s,\-–]+(?:\d{4}))", raw_text)
-    if period:
-        fields["service_period"] = period.strip()
-
-    found = list(fields.keys())
-    logger.info("parsing complete", fields_found=found, total_fields=len(found))
-
+    logger.info("regex fallback complete", fields_found=list(fields.keys()))
     return fields

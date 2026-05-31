@@ -8,4 +8,7 @@ __pycache__/
 .ruff_cache/
 .prefect/
 dist/
-*.egg-info/
+*.egg-info/.env.production
+uploads/
+staging/
+incoming/

@@ -10,7 +10,6 @@ services:
       POSTGRES_USER: postgres
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./migrations/001_initial_schema.sql:/docker-entrypoint-initdb.d/001_initial_schema.sql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 5s

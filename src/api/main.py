@@ -14,6 +14,18 @@ from src.validation.engine import validate
 from src.routing.approver import route
 from src.routing.notifier import notify
 
+from contextlib import asynccontextmanager
+from src.db import run_migrations
+
+
+@asynccontextmanager
+async def lifespan(app_instance):
+    run_migrations()
+    yield
+
+
+app = FastAPI(title="Invoice Pipeline", lifespan=lifespan)
+
 setup_logging()
 logger = get_logger(__name__)
 

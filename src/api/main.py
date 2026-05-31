@@ -9,7 +9,7 @@ from pathlib import Path
 
 import structlog
 import structlog.contextvars
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from sse_starlette.sse import EventSourceResponse
 
@@ -59,6 +59,8 @@ class QueueLogProcessor:
 
 def run_pipeline_sync(file_path: Path, file_id: uuid.UUID, run_id: str) -> None:
     q = _log_queues[run_id]
+    import os
+    os.environ["PREFECT_API_URL"] = "http://prefect-server:4200/api"
 
     def emit(level: str, event: str, **kwargs):
         q.put({"level": level, "event": event, **kwargs})
@@ -147,23 +149,20 @@ async def upload_invoice(file: UploadFile = File(...)):
 
     logger.info("invoice uploaded via web", filename=file.filename, run_id=run_id)
 
-    # Create the log queue for this run
     _log_queues[run_id] = queue.Queue()
 
-    # Run pipeline in a background thread so we don't block the event loop
-    result_holder = {}
-
     def run():
-        result_holder["result"] = run_pipeline_sync(dest, file_id, run_id)
+        import os
+        os.environ["PREFECT_API_URL"] = "http://prefect-server:4200/api"
+        run_pipeline_sync(dest, file_id, run_id)
 
     thread = threading.Thread(target=run, daemon=True)
     thread.start()
 
     return JSONResponse(content={"run_id": run_id})
 
-
 @app.get("/stream/{run_id}")
-async def stream_logs(run_id: str):
+async def stream_logs(run_id: str, request: Request):
     if run_id not in _log_queues:
         raise HTTPException(status_code=404, detail="run not found")
 
@@ -188,7 +187,11 @@ async def stream_logs(run_id: str):
         finally:
             _log_queues.pop(run_id, None)
 
-    return EventSourceResponse(event_generator())
+    response = EventSourceResponse(event_generator())
+    response.headers["X-Accel-Buffering"] = "no"
+    response.headers["Cache-Control"] = "no-cache"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    return response
 @app.get("/result/{run_id}")
 async def get_result(run_id: str):
     """Polling fallback — returns result once pipeline is complete."""

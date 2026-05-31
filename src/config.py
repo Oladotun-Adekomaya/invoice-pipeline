@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     environment: str = "development"
     tesseract_cmd: str = ""
     anthropic_api_key: str = ""
+    prefect_api_url: str = "http://prefect-server:4200/api"
 
 
 settings: Settings = Settings() # type: ignore

@@ -34,6 +34,7 @@ services:
     ports:
       - "24574:8000"
     environment:
+      PREFECT_API_URL: http://prefect-server:4200/api
       DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@postgres:5432/invoices
       SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL}
       AUTO_APPROVE_THRESHOLD: ${AUTO_APPROVE_THRESHOLD:-5000.00}

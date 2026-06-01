@@ -35,10 +35,10 @@ _log_queues: dict[str, queue.Queue] = {}
 
 
 def _run_pipeline(file_path: Path, run_id: str) -> None:
-    from src.pipeline import run_pipeline, _thread_queue as _pipeline_thread_queue
+    from src.pipeline import run_pipeline, _current_queue as _pipeline_thread_queue
 
     q = _log_queues[run_id]
-    _pipeline_thread_queue.queue = q
+    _pipeline_thread_queue.set(q)
 
     def emit(level: str, event: str) -> None:
         q.put({"level": level, "event": event})
@@ -54,7 +54,7 @@ def _run_pipeline(file_path: Path, run_id: str) -> None:
         emit("error", f"✗ Pipeline error: {e}")
         q.put({"status": "error", "reason": str(e), "fields": {}, "failed_rules": []})
     finally:
-        _pipeline_thread_queue.queue = None
+        _pipeline_thread_queue.set(None)
         file_path.unlink(missing_ok=True)
         q.put(None)  # sentinel — close the stream
 

@@ -1,4 +1,3 @@
-import threading
 import structlog.contextvars
 from pathlib import Path
 from uuid import uuid4, UUID
@@ -18,15 +17,15 @@ from src.routing.notifier import notify
 setup_logging()
 logger = get_logger(__name__)
 
-# Thread-local SSE queue injected by the API layer during web-triggered runs.
-_thread_queue: threading.local = threading.local()
 
+import contextvars
+
+_current_queue: contextvars.ContextVar = contextvars.ContextVar('pipeline_queue', default=None)
 
 def _emit(level: str, event: str) -> None:
-    q = getattr(_thread_queue, "queue", None)
+    q = _current_queue.get()
     if q is not None:
         q.put({"level": level, "event": event})
-
 
 @task(name="stage-file", retries=2, retry_delay_seconds=5)
 def stage_file_task(path: str) -> FileRecord:
